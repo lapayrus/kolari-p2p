@@ -1,269 +1,217 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
+
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-		if allowedOrigin == "" {
-			allowedOrigin = "http://localhost:8080" 
-		}
-		return r.Header.Get("Origin") == allowedOrigin
-	},
-}
-
-type Client struct {
-	conn                *websocket.Conn
-	send                chan WebSocketMessage
-	currentFileMetadata map[string]interface{}
-	closeOnce           sync.Once
-}
-
-type WebSocketMessage struct {
-	Type int // websocket.TextMessage or websocket.BinaryMessage
-	Data []byte
-}
-
-type Message struct {
-	Type     int // websocket.TextMessage or websocket.BinaryMessage
-	Data     []byte
-	Sender   *Client
-	Metadata map[string]interface{} 
-}
-
-type Room struct {
-	clients    map[*Client]bool
-	broadcast  chan Message
-	register   chan *Client
-	unregister chan *Client
-}
-
-var rooms = make(map[string]*Room)
-var roomsMutex = sync.Mutex{}
-
-func (r *Room) run() {
-	for {
-		select {
-		case client := <-r.register:
-			r.clients[client] = true
-			if len(r.clients) > 1 {
-				for c := range r.clients {
-					select {
-					case c.send <- WebSocketMessage{Type: websocket.TextMessage, Data: []byte(`{"type": "status", "message": "User has joined. You can now share files.", "ready": true}`)}:
-					default:
-						close(c.send)
-						delete(r.clients, c)
-					}
-				}
-			}
-		case client := <-r.unregister:
-			if _, ok := r.clients[client]; ok {
-				delete(r.clients, client)
-				close(client.send)
-			}
-		case message := <-r.broadcast:
-			for client := range r.clients {
-				if client == message.Sender {
-					continue 
-				}
-
-				// Add isSender flag to the message metadata if it's a file
-				var dataToSend []byte
-				msgType := message.Type
-
-				if message.Type == websocket.BinaryMessage {
-					
-					metadata := message.Metadata
-					metadata["isSender"] = false 
-					if metadataJSON, err := json.Marshal(metadata); err == nil {
-						select {
-						case client.send <- WebSocketMessage{Type: websocket.TextMessage, Data: metadataJSON}:
-						default:
-					log.Printf("Error sending metadata to client: %v", err)
-					client.closeOnce.Do(func() { close(client.send) })
-					delete(r.clients, client)
-					continue
-						}
-					}
-					dataToSend = message.Data
-				} else {
-					
-					var msg map[string]interface{}
-					if err := json.Unmarshal(message.Data, &msg); err == nil {
-						msg["isSender"] = false 
-						if newData, err := json.Marshal(msg); err == nil {
-							dataToSend = newData
-						} else {
-							log.Printf("Error marshaling text message: %v", err)
-							continue
-						}
-					} else {
-						log.Printf("Error unmarshaling text message: %v", err)
-						continue
-					}
-				}
-
-				select {
-				case client.send <- WebSocketMessage{Type: msgType, Data: dataToSend}:
-				default:
-					log.Printf("Client %v buffer full, disconnecting", client)
-					close(client.send)
-					delete(r.clients, client)
-				}
-			}
-		}
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for now
+		},
 	}
+	sessions      = make(map[string]map[string]*websocket.Conn)
+	sessionsMutex sync.Mutex
+)
+
+func generateSessionHandler(w http.ResponseWriter, r *http.Request) {
+	sessionsMutex.Lock()
+	defer sessionsMutex.Unlock()
+
+	u := uuid.New().String()
+	// Ensure UUID is unique
+	for {
+		if _, ok := sessions[u]; !ok {
+			break
+		}
+		u = uuid.New().String()
+	}
+	sessions[u] = make(map[string]*websocket.Conn)
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"uuid": "%s"}`, u)
 }
 
-func serveWs(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	roomId := vars["roomId"]
+func sessionHandler(w http.ResponseWriter, r *http.Request) {
+	uuid := r.URL.Path[1:] // Remove leading slash
 
-	roomsMutex.Lock()
-	room, ok := rooms[roomId]
-	if !ok {
-		roomsMutex.Unlock()
+	sessionsMutex.Lock()
+	defer sessionsMutex.Unlock()
+
+	if _, ok := sessions[uuid]; !ok {
+		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	roomsMutex.Unlock()
 
+	t, err := template.ParseFiles("public/session.html")
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("Error parsing session.html: %v", err)
+		return
+	}
+	t.Execute(w, nil)
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
+	defer conn.Close()
 
-	client := &Client{conn: conn, send: make(chan WebSocketMessage, 256), currentFileMetadata: make(map[string]interface{})}
-	room.register <- client
+	sessionID := r.URL.Path[len("/ws/"):]
+	peerID := uuid.New().String() // Assign a unique ID to this peer
 
-	go client.writePump()
-	go client.readPump(room)
-}
+	sessionsMutex.Lock()
+	if _, ok := sessions[sessionID]; !ok {
+		sessionsMutex.Unlock()
+		log.Printf("Attempted to connect to non-existent session: %s", sessionID)
+		return
+	}
+	sessions[sessionID][peerID] = conn
+	sessionsMutex.Unlock()
 
-func (c *Client) readPump(room *Room) {
-	defer func() {
-		room.unregister <- c
-		c.conn.Close()
-		c.closeOnce.Do(func() { close(c.send) })
-	}()
-	
-	c.conn.SetReadLimit(500 * 1024 * 1024)
+	log.Printf("Client %s connected to session %s: %s", peerID, sessionID, conn.RemoteAddr().String())
+
+	// Send the new peer's ID to all existing peers in the session
+	sessionsMutex.Lock()
+	for existingPeerID, existingConn := range sessions[sessionID] {
+		if existingPeerID != peerID {
+			if err := existingConn.WriteJSON(map[string]interface{}{"type": "new-peer", "peerId": peerID}); err != nil {
+				log.Printf("Error sending new-peer message to %s: %v", existingPeerID, err)
+				existingConn.Close()
+				delete(sessions[sessionID], existingPeerID)
+			}
+		}
+	}
+	sessionsMutex.Unlock()
+
+	// Send existing peer IDs to the newly connected peer
+	sessionsMutex.Lock()
+	var existingPeerIDs []string
+	for existingPeerID := range sessions[sessionID] {
+		if existingPeerID != peerID {
+			existingPeerIDs = append(existingPeerIDs, existingPeerID)
+		}
+	}
+	if len(existingPeerIDs) > 0 {
+		if err := conn.WriteJSON(map[string]interface{}{"type": "existing-peers", "peerIds": existingPeerIDs}); err != nil {
+			log.Printf("Error sending existing-peers message to new client %s: %v", peerID, err)
+			conn.Close()
+			delete(sessions[sessionID], peerID)
+		}
+	}
+	sessionsMutex.Unlock()
 
 	for {
-		messageType, p, err := c.conn.ReadMessage()
+		var msg map[string]interface{}
+		err = conn.ReadJSON(&msg)
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("client disconnected: %v", err)
-			} else {
-				log.Printf("read error: %v", err)
-			}
+			log.Printf("Error reading JSON message from %s: %v", conn.RemoteAddr().String(), err)
 			break
 		}
 
-		if messageType == websocket.TextMessage {
-			var msg map[string]interface{}
-			if err := json.Unmarshal(p, &msg); err != nil {
-				log.Printf("unmarshal text message error: %v", err)
-				continue
-			}
-			if msg["type"] == "file_metadata" {
-				c.currentFileMetadata = msg
+		log.Printf("Received message from %s in session %s: %+v", conn.RemoteAddr().String(), peerID, msg)
+
+		// Add sender's peer ID to the message
+		msg["from"] = peerID
+
+		// Handle WebRTC signaling messages
+		sessionsMutex.Lock()
+		if msgType, ok := msg["type"]; ok && (msgType == "offer" || msgType == "answer" || msgType == "ice-candidate") {
+			if toPeerID, ok := msg["to"].(string); ok {
+				if targetConn, found := sessions[sessionID][toPeerID]; found {
+					if err := targetConn.WriteJSON(msg); err != nil {
+						log.Printf("Error relaying WebRTC signaling message to client %s: %v", toPeerID, err)
+						targetConn.Close()
+						delete(sessions[sessionID], toPeerID)
+					}
+				} else {
+					log.Printf("Target peer %s not found in session %s", toPeerID, sessionID)
+				}
 			} else {
-				
-				room.broadcast <- Message{Type: websocket.TextMessage, Data: p, Sender: c}
+				log.Printf("Invalid 'to' field in signaling message from %s", peerID)
 			}
-		} else if messageType == websocket.BinaryMessage {
-			if c.currentFileMetadata != nil {
-				
-				room.broadcast <- Message{Type: websocket.BinaryMessage, Data: p, Sender: c, Metadata: c.currentFileMetadata}
-				c.currentFileMetadata = nil 
-			} else {
-				log.Println("Received binary message without preceding metadata")
+		} else if msgType, ok := msg["type"]; ok && msgType == "text-sync" {
+			// Broadcast text-sync messages to all other clients
+			for pID, client := range sessions[sessionID] {
+				if pID != peerID {
+					if err := client.WriteJSON(msg); err != nil {
+						log.Printf("Error writing text-sync message to client %s: %v", pID, err)
+						client.Close()
+						delete(sessions[sessionID], pID)
+					}
+				}
+			}
+		}
+
+		// Special handling for file-sent messages: change type to file-received for others
+		if msgType, ok := msg["type"]; ok && msgType == "file-sent" {
+			msg["type"] = "file-received"
+			// Broadcast file-received messages to all other clients
+			for pID, client := range sessions[sessionID] {
+				if pID != peerID {
+					if err := client.WriteJSON(msg); err != nil {
+						log.Printf("Error writing file-received message to client %v: %v", pID, err)
+						client.Close()
+						delete(sessions[sessionID], pID)
+					}
+				}
+			}
+		}
+
+		// If no clients left, delete the session
+		if len(sessions[sessionID]) == 0 {
+			log.Printf("Session %s is empty, deleting.", sessionID)
+			delete(sessions, sessionID)
+		}
+		sessionsMutex.Unlock()
+	}
+
+	// Clean up on disconnect
+	sessionsMutex.Lock()
+	delete(sessions[sessionID], peerID)
+	// Notify other peers that this peer has disconnected
+	for existingPeerID, existingConn := range sessions[sessionID] {
+		if existingPeerID != peerID {
+			if err := existingConn.WriteJSON(map[string]interface{}{"type": "peer-disconnected", "peerId": peerID}); err != nil {
+				log.Printf("Error sending peer-disconnected message to %s: %v", existingPeerID, err)
+				existingConn.Close()
+				delete(sessions[sessionID], existingPeerID)
 			}
 		}
 	}
-}
 
-func (c *Client) writePump() {
-	defer func() {
-		c.conn.Close()
-	}()
-	for {
-		select {
-		case wsMsg, ok := <-c.send:
-			if !ok {
-				
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			err := c.conn.WriteMessage(wsMsg.Type, wsMsg.Data)
-			if err != nil {
-				log.Printf("write error: %v", err)
-				return
-			}
-		}
+	if len(sessions[sessionID]) == 0 {
+		log.Printf("Session %s is empty, deleting.", sessionID)
+		delete(sessions, sessionID)
 	}
-}
-
-func serveHome(w http.ResponseWriter, r *http.Request) {
-	roomId := uuid.New().String()[:8]
-	http.Redirect(w, r, "/"+roomId, http.StatusFound)
-}
-
-func serveRoom(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	roomId := vars["roomId"]
-
-	roomsMutex.Lock()
-	if _, ok := rooms[roomId]; !ok {
-		rooms[roomId] = &Room{
-			broadcast:  make(chan Message),
-			register:   make(chan *Client),
-			unregister: make(chan *Client),
-			clients:    make(map[*Client]bool),
-		}
-		go rooms[roomId].run()
-	}
-	roomsMutex.Unlock()
-
-	tmpl, err := template.ParseFiles("templates/index.html")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	tmpl.Execute(w, nil)
+	sessionsMutex.Unlock()
+	log.Printf("Client %s disconnected from session %s: %s", peerID, sessionID, conn.RemoteAddr().String())
 }
 
 func main() {
-	r := mux.NewRouter()
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.ServeFile(w, r, "public/index.html")
+			return
+		}
+		sessionHandler(w, r) // This will handle UUID paths
+	})
+	http.HandleFunc("/generate-session", generateSessionHandler)
+	http.HandleFunc("/ws/", wsHandler)
 
-	fs := http.FileServer(http.Dir("./static/"))
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fs))
-
-	r.HandleFunc("/", serveHome)
-	r.HandleFunc("/{roomId}", serveRoom)
-	r.HandleFunc("/ws/{roomId}", serveWs)
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	fmt.Printf("Starting server on :%s\n", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatal(err)
-	}
+	fmt.Println("Server starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }

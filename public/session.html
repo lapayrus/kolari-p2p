@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session - P2P Document Sharing</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .container {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 900px;
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        textarea {
+            width: calc(100% - 20px);
+            height: 300px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            resize: vertical;
+        }
+        .file-section {
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+            margin-top: 20px;
+        }
+        .file-section h2 {
+            color: #555;
+            margin-bottom: 15px;
+        }
+        input[type="file"] {
+            margin-bottom: 15px;
+        }
+        .file-list {
+            border: 1px solid #eee;
+            padding: 10px;
+            min-height: 100px;
+            max-height: 200px;
+            overflow-y: auto;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        .file-list div {
+            padding: 8px 0;
+            border-bottom: 1px dashed #eee;
+        }
+        .file-list div:last-child {
+            border-bottom: none;
+        }
+        .file-list a {
+            color: #007bff;
+            text-decoration: none;
+        }
+        .file-list a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Session ID: <span id="sessionId"></span></h1>
+        <textarea id="editor" placeholder="Start typing..."></textarea>
+
+        <div class="file-section">
+            <h2>Upload Document</h2>
+            <input type="file" id="fileInput">
+            <button id="uploadBtn">Upload</button>
+        </div>
+
+        <div class="file-section">
+            <h2>Received Documents</h2>
+            <div id="receivedFiles" class="file-list">
+                <p>No documents received yet.</p>
+            </div>
+        </div>
+
+        <div class="file-section">
+            <h2>Sent Documents</h2>
+            <div id="sentFiles" class="file-list">
+                <p>No documents sent yet.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const sessionId = window.location.pathname.substring(1);
+        document.getElementById('sessionId').textContent = sessionId;
+
+        const editor = document.getElementById('editor');
+        const ws = new WebSocket(`ws://${window.location.host}/ws/${sessionId}`);
+
+        const peerConnections = {}; // Store RTCPeerConnection objects by peer ID
+        let localPeerId = ''; // To store the unique ID assigned by the server
+
+        ws.onopen = () => {
+            console.log('WebSocket connected');
+        };
+
+        // Function to send signaling messages via WebSocket
+        function sendSignalingMessage(message) {
+            ws.send(JSON.stringify(message));
+        }
+
+        ws.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Received message:', data);
+
+            if (data.type === 'text-sync') {
+                editor.value = data.content;
+            } else if (data.type === 'client-connected') {
+                localPeerId = data.peerId;
+                console.log('Assigned local peer ID:', localPeerId);
+            } else if (data.type === 'file-received') {
+                const receivedFilesDiv = document.getElementById('receivedFiles');
+                receivedFilesDiv.innerHTML = ''; // Clear "No documents received yet."
+                const fileEntry = document.createElement('div');
+                // The actual download link will be created when the file data is received via DataChannel
+                fileEntry.innerHTML = `<p>${data.filename} (Received - preparing download)</p>`;
+                receivedFilesDiv.appendChild(fileEntry);
+            } else if (data.type === 'new-peer') {
+                // A new peer has joined the session, initiate a connection
+                console.log('New peer joined:', data.peerId);
+                createNewPeerConnection(data.peerId, true); // true indicates it's an initiator
+            } else if (data.type === 'existing-peers') {
+                // Received a list of existing peers, connect to them
+                console.log('Existing peers:', data.peerIds);
+                data.peerIds.forEach(peerId => {
+                    createNewPeerConnection(peerId, false); // false indicates not an initiator
+                });
+            } else if (data.type === 'peer-disconnected') {
+                // A peer has disconnected
+                console.log('Peer disconnected:', data.peerId);
+                if (peerConnections[data.peerId]) {
+                    peerConnections[data.peerId].close();
+                    delete peerConnections[data.peerId];
+                }
+            } else if (data.type === 'offer') {
+                // Handle WebRTC offer
+                let peerConnection = peerConnections[data.from];
+                if (!peerConnection) {
+                    peerConnection = new RTCPeerConnection();
+                    peerConnections[data.from] = peerConnection;
+                    setupPeerConnection(peerConnection, data.from);
+                }
+
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                sendSignalingMessage({ type: 'answer', sdp: peerConnection.localDescription, to: data.from });
+            } else if (data.type === 'answer') {
+                // Handle WebRTC answer
+                const peerConnection = peerConnections[data.from];
+                if (peerConnection) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                }
+            } else if (data.type === 'ice-candidate') {
+                // Handle ICE candidate
+                const peerConnection = peerConnections[data.from];
+                if (peerConnection) {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            }
+        };
+
+        ws.onclose = () => {
+            console.log('WebSocket disconnected');
+            // Close all peer connections when WebSocket disconnects
+            for (const peerId in peerConnections) {
+                if (peerConnections.hasOwnProperty(peerId)) {
+                    peerConnections[peerId].close();
+                    delete peerConnections[peerId];
+                }
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+        };
+
+        editor.addEventListener('input', () => {
+            ws.send(JSON.stringify({ type: 'text-sync', content: editor.value }));
+        });
+
+        // WebRTC Setup
+        function setupPeerConnection(peerConnection, peerId) {
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    sendSignalingMessage({ type: 'ice-candidate', candidate: event.candidate, to: peerId });
+                }
+            };
+
+            peerConnection.ondatachannel = (event) => {
+                const dataChannel = event.channel;
+                console.log('Data channel received:', dataChannel.label);
+
+                if (dataChannel.label === 'file-transfer') {
+                    handleFileReceiveDataChannel(dataChannel);
+                }
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                console.log(`Peer connection state with ${peerId}: ${peerConnection.connectionState}`);
+            };
+        }
+
+        // Function to initiate a new peer connection
+        function createNewPeerConnection(peerId, isInitiator) {
+            const peerConnection = new RTCPeerConnection();
+            peerConnections[peerId] = peerConnection;
+            setupPeerConnection(peerConnection, peerId);
+
+            if (isInitiator) {
+                // Create data channel for file transfer if this peer initiates the connection
+                const fileDataChannel = peerConnection.createDataChannel('file-transfer');
+                handleFileSendDataChannel(fileDataChannel);
+
+                peerConnection.createOffer()
+                    .then(offer => peerConnection.setLocalDescription(offer))
+                    .then(() => {
+                        sendSignalingMessage({ type: 'offer', sdp: peerConnection.localDescription, to: peerId });
+                    })
+                    .catch(error => console.error('Error creating offer:', error));
+            }
+        }
+
+            let receivedFileBuffer = [];
+            let receivedFileName = '';
+            let receivedFileSize = 0;
+            let receivedBytes = 0;
+
+        function handleFileReceiveDataChannel(dataChannel) {
+            dataChannel.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    // Metadata message
+                    const metadata = JSON.parse(event.data);
+                    receivedFileName = metadata.filename;
+                    receivedFileSize = metadata.fileSize;
+                    receivedBytes = 0;
+                    receivedFileBuffer = [];
+                    console.log(`Receiving file: ${receivedFileName} (${receivedFileSize} bytes)`);
+                } else {
+                    // File data chunk
+                    receivedFileBuffer.push(event.data);
+                    receivedBytes += event.data.byteLength;
+                    console.log(`Received ${receivedBytes} of ${receivedFileSize} bytes`);
+
+                    if (receivedBytes === receivedFileSize) {
+                        const receivedBlob = new Blob(receivedFileBuffer);
+                        const downloadUrl = URL.createObjectURL(receivedBlob);
+
+                        const receivedFilesDiv = document.getElementById('receivedFiles');
+                        receivedFilesDiv.innerHTML = ''; // Clear previous messages
+                        const fileEntry = document.createElement('div');
+                        fileEntry.innerHTML = `<a href="${downloadUrl}" download="${receivedFileName}">${receivedFileName} (Download)</a>`;
+                        receivedFilesDiv.appendChild(fileEntry);
+
+                        console.log('File received and ready for download:', receivedFileName);
+                        receivedFileBuffer = []; // Clear buffer
+                    }
+                }
+            };
+
+            dataChannel.onopen = () => console.log('Receive DataChannel opened');
+            dataChannel.onclose = () => console.log('Receive DataChannel closed');
+            dataChannel.onerror = (error) => console.error('Receive DataChannel error:', error);
+        }
+
+        function handleFileSendDataChannel(dataChannel) {
+            dataChannel.onopen = () => console.log('Send DataChannel opened');
+            dataChannel.onclose = () => console.log('Send DataChannel closed');
+            dataChannel.onerror = (error) => console.error('Send DataChannel error:', error);
+        }
+
+        document.getElementById('uploadBtn').addEventListener('click', async () => {
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput.files.length > 0) {
+                const file = fileInput.files[0];
+
+                // Simulate sending file metadata via WebSocket to signal other peers
+                ws.send(JSON.stringify({ type: 'file-sent', filename: file.name, fileSize: file.size }));
+
+                const sentFilesDiv = document.getElementById('sentFiles');
+                sentFilesDiv.innerHTML = ''; // Clear "No documents sent yet."
+                const fileEntry = document.createElement('div');
+                fileEntry.innerHTML = `<p>${file.name} (Sending...)</p>`;
+                sentFilesDiv.appendChild(fileEntry);
+
+                // For simplicity, we'll iterate through all connected peers and send the file to each
+                // In a real scenario, you might select specific peers or broadcast more efficiently
+                for (const peerId in peerConnections) {
+                    if (peerConnections.hasOwnProperty(peerId)) {
+                        const peerConnection = peerConnections[peerId];
+                        const sendChannel = peerConnection.createDataChannel('file-transfer');
+                        handleFileSendDataChannel(sendChannel);
+
+                        sendChannel.onopen = () => {
+                            console.log(`Send DataChannel ready for ${peerId}, sending file...`);
+                            sendChannel.send(JSON.stringify({ filename: file.name, fileSize: file.size }));
+
+                            const chunkSize = 16 * 1024; // 16KB chunks
+                            let offset = 0;
+
+                            const fileReader = new FileReader();
+                            fileReader.onload = (e) => {
+                                sendChannel.send(e.target.result);
+                                offset += e.target.result.byteLength;
+
+                                if (offset < file.size) {
+                                    readNextChunk();
+                                } else {
+                                    console.log(`File sent successfully to ${peerId}!`);
+                                    fileEntry.innerHTML = `<p>${file.name} (Sent)</p>`;
+                                }
+                            };
+
+                            fileReader.onerror = (error) => console.error('Error reading file:', error);
+
+                            const readNextChunk = () => {
+                                const slice = file.slice(offset, offset + chunkSize);
+                                fileReader.readAsArrayBuffer(slice);
+                            };
+
+                            readNextChunk();
+                        };
+                    }
+                }
+            }
+        });
+
+    </script>
+</body>
+</html>
