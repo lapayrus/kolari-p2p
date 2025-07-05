@@ -18,7 +18,7 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 		if allowedOrigin == "" {
-			allowedOrigin = "http://localhost:8080"
+			allowedOrigin = "http://localhost:8080" 
 		}
 		return r.Header.Get("Origin") == allowedOrigin
 	},
@@ -39,7 +39,7 @@ type Message struct {
 	Type     int // websocket.TextMessage or websocket.BinaryMessage
 	Data     []byte
 	Sender   *Client
-	Metadata map[string]interface{}
+	Metadata map[string]interface{} 
 }
 
 type Room struct {
@@ -75,16 +75,17 @@ func (r *Room) run() {
 		case message := <-r.broadcast:
 			for client := range r.clients {
 				if client == message.Sender {
-					continue
+					continue 
 				}
 
+				// Add isSender flag to the message metadata if it's a file
 				var dataToSend []byte
 				msgType := message.Type
 
 				if message.Type == websocket.BinaryMessage {
-
+					
 					metadata := message.Metadata
-					metadata["isSender"] = false
+					metadata["isSender"] = false 
 					if metadataJSON, err := json.Marshal(metadata); err == nil {
 						select {
 						case client.send <- WebSocketMessage{Type: websocket.TextMessage, Data: metadataJSON}:
@@ -96,13 +97,11 @@ func (r *Room) run() {
 					}
 					dataToSend = message.Data
 				} else {
-
+					
 					var msg map[string]interface{}
 					if err := json.Unmarshal(message.Data, &msg); err == nil {
-						msg["isSender"] = false
-						var newData []byte
-						var marshalErr error
-						if newData, marshalErr = json.Marshal(msg); marshalErr == nil {
+						msg["isSender"] = false 
+						if newData, err := json.Marshal(msg); err == nil {
 							dataToSend = newData
 						} else {
 							log.Printf("Error marshaling text message: %v", err)
@@ -155,7 +154,7 @@ func (c *Client) readPump(room *Room) {
 		room.unregister <- c
 		c.conn.Close()
 	}()
-
+	
 	c.conn.SetReadLimit(500 * 1024 * 1024)
 
 	for {
@@ -178,14 +177,14 @@ func (c *Client) readPump(room *Room) {
 			if msg["type"] == "file_metadata" {
 				c.currentFileMetadata = msg
 			} else {
-
+				
 				room.broadcast <- Message{Type: websocket.TextMessage, Data: p, Sender: c}
 			}
 		} else if messageType == websocket.BinaryMessage {
 			if c.currentFileMetadata != nil {
-
+				
 				room.broadcast <- Message{Type: websocket.BinaryMessage, Data: p, Sender: c, Metadata: c.currentFileMetadata}
-				c.currentFileMetadata = nil
+				c.currentFileMetadata = nil 
 			} else {
 				log.Println("Received binary message without preceding metadata")
 			}
@@ -197,17 +196,20 @@ func (c *Client) writePump() {
 	defer func() {
 		c.conn.Close()
 	}()
-	for range c.send {
-		wsMsg, ok := <-c.send
-		if !ok {
-			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-			return
-		}
+	for {
+		select {
+		case wsMsg, ok := <-c.send:
+			if !ok {
+				
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
 
-		err := c.conn.WriteMessage(wsMsg.Type, wsMsg.Data)
-		if err != nil {
-			log.Printf("write error: %v", err)
-			return
+			err := c.conn.WriteMessage(wsMsg.Type, wsMsg.Data)
+			if err != nil {
+				log.Printf("write error: %v", err)
+				return
+			}
 		}
 	}
 }

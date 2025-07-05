@@ -44,7 +44,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     receivedFilesList.appendChild(li);
                 }
-                currentFileMetadata = null; 
+                currentFileMetadata = null; // Clear metadata after processing
             } else {
                 console.warn('Received binary data without preceding file metadata.');
             }
