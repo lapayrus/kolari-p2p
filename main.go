@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/google/uuid"
@@ -226,6 +227,25 @@ func main() {
 	http.HandleFunc("/generate-session", generateSessionHandler)
 	http.HandleFunc("/ws/", wsHandler)
 
-	fmt.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// var err error
+	// if os.Getenv("APP_ENV") == "production" {
+	// certFile := os.Getenv("TLS_CERT_FILE")
+	// keyFile := os.Getenv("TLS_KEY_FILE")
+	// if certFile == "" || keyFile == "" {
+	// 	log.Fatal("TLS_CERT_FILE and TLS_KEY_FILE environment variables must be set for production environment")
+	// }
+	// err = http.ListenAndServeTLS(":"+port, certFile, keyFile, nil)
+	// } else {
+	// err = http.ListenAndServe(":"+port, nil)
+	// }
+	err := http.ListenAndServe(":"+port, nil)
+
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
 }
