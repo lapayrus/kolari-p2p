@@ -28,6 +28,7 @@ type Client struct {
 	conn                *websocket.Conn
 	send                chan WebSocketMessage
 	currentFileMetadata map[string]interface{}
+	closeOnce           sync.Once
 }
 
 type WebSocketMessage struct {
@@ -90,9 +91,10 @@ func (r *Room) run() {
 						select {
 						case client.send <- WebSocketMessage{Type: websocket.TextMessage, Data: metadataJSON}:
 						default:
-							log.Printf("Error sending metadata to client: %v", err)
-							close(client.send)
-							continue
+					log.Printf("Error sending metadata to client: %v", err)
+					client.closeOnce.Do(func() { close(client.send) })
+					delete(r.clients, client)
+					continue
 						}
 					}
 					dataToSend = message.Data
@@ -116,6 +118,7 @@ func (r *Room) run() {
 				select {
 				case client.send <- WebSocketMessage{Type: msgType, Data: dataToSend}:
 				default:
+					log.Printf("Client %v buffer full, disconnecting", client)
 					close(client.send)
 					delete(r.clients, client)
 				}
@@ -153,6 +156,7 @@ func (c *Client) readPump(room *Room) {
 	defer func() {
 		room.unregister <- c
 		c.conn.Close()
+		c.closeOnce.Do(func() { close(c.send) })
 	}()
 	
 	c.conn.SetReadLimit(500 * 1024 * 1024)
