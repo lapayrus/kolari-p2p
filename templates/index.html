@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalori - P2P Document Sharing</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f0f0f0; color: #333; }
+        #container { max-width: 800px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #status { margin-bottom: 20px; padding: 10px; background-color: #e7e7e7; border-radius: 4px; }
+        #drop-zone { border: 2px dashed #ccc; border-radius: 4px; padding: 40px; text-align: center; margin-bottom: 20px; cursor: pointer; }
+        #drop-zone.hidden { display: none; }
+        #file-list { list-style: none; padding: 0; }
+        #file-list li { background-color: #f9f9f9; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>Kalori - P2P Document Sharing</h1>
+        <div id="status">Connecting to server...</div>
+        <div id="drop-zone" class="hidden">
+            <p>Drag & drop a file here or click to select a file</p>
+            <input type="file" id="file-input" style="display: none;">
+        </div>
+        <h3>Sent Files:</h3>
+        <ul id="sent-files-list"></ul>
+        <h3>Received Files:</h3>
+        <ul id="received-files-list"></ul>
+    </div>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
