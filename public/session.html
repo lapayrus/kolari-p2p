@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Session - P2P Document Sharing</title>
+    <title>Kalori - P2P Document Sharing</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -80,6 +80,10 @@
 <body>
     <div class="container">
         <h1>Session ID: <span id="sessionId"></span></h1>
+        <p id="userCountDisplay">Current Users: 1</p>
+
+        <div id="userNotJoinInfo">Let other users join, then we can start</div>
+
         <textarea id="editor" placeholder="Start typing..."></textarea>
 
         <div class="file-section">
@@ -108,16 +112,44 @@
         document.getElementById('sessionId').textContent = sessionId;
 
         const editor = document.getElementById('editor');
-        const ws = new WebSocket(`ws://${window.location.host}/ws/${sessionId}`);
+        const receivedFilesDiv = document.getElementById('receivedFiles');
+        const userCountDisplay = document.getElementById('userCountDisplay');
+        const fileSections = document.getElementsByClassName('file-section');
+        const userNotJoinInfo = document.getElementById('userNotJoinInfo');
 
-        const peerConnections = {}; // Store RTCPeerConnection objects by peer ID
-        let localPeerId = ''; // To store the unique ID assigned by the server
+        const peerConnections = {};
+        let localPeerId = '';
+
+        function setCookie(name, value, days) {
+            let expires = "";
+            if (days) {
+                const date = new Date();
+                date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+                expires = "; expires=" + date.toUTCString();
+            }
+            document.cookie = name + "=" + (value || "") + expires + "; path=/";
+        }
+
+        function getCookie(name) {
+            const nameEQ = name + "=";
+            const ca = document.cookie.split(';');
+            for(let i=0; i < ca.length; i++) {
+                let c = ca[i];
+                while (c.charAt(0) === ' ') c = c.substring(1, c.length);
+                if (c.indexOf(nameEQ) === 0) return c.substring(nameEQ.length, c.length);
+            }
+            return null;
+        }
+
+        let storedPeerId = getCookie(`peerId_${sessionId}`);
+
+        const wsUrl = storedPeerId ? `ws://${window.location.host}/ws/${sessionId}?peerId=${storedPeerId}` : `ws://${window.location.host}/ws/${sessionId}`;
+        const ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
             console.log('WebSocket connected');
         };
 
-        // Function to send signaling messages via WebSocket
         function sendSignalingMessage(message) {
             ws.send(JSON.stringify(message));
         }
@@ -131,32 +163,45 @@
             } else if (data.type === 'client-connected') {
                 localPeerId = data.peerId;
                 console.log('Assigned local peer ID:', localPeerId);
+                setCookie(`peerId_${sessionId}`, localPeerId, 1);
+                if (data.userCount !== undefined) {
+                    userCountDisplay.textContent = `Current Users: ${data.userCount}`;
+                }
+            } else if (data.type === 'client-reconnected') {
+                localPeerId = data.peerId;
+                console.log('Reconnected with existing peer ID:', localPeerId);
+                alert('You are already connected to this session in another tab.');
+                window.location.href = '/';
             } else if (data.type === 'file-received') {
                 const receivedFilesDiv = document.getElementById('receivedFiles');
-                receivedFilesDiv.innerHTML = ''; // Clear "No documents received yet."
+                receivedFilesDiv.innerHTML = '';
                 const fileEntry = document.createElement('div');
-                // The actual download link will be created when the file data is received via DataChannel
                 fileEntry.innerHTML = `<p>${data.filename} (Received - preparing download)</p>`;
                 receivedFilesDiv.appendChild(fileEntry);
             } else if (data.type === 'new-peer') {
-                // A new peer has joined the session, initiate a connection
                 console.log('New peer joined:', data.peerId);
-                createNewPeerConnection(data.peerId, true); // true indicates it's an initiator
+                createNewPeerConnection(data.peerId, true);
+                if (data.userCount !== undefined) {
+                    userCountDisplay.textContent = `Current Users: ${data.userCount}`;
+                }
             } else if (data.type === 'existing-peers') {
-                // Received a list of existing peers, connect to them
                 console.log('Existing peers:', data.peerIds);
-                data.peerIds.forEach(peerId => {
-                    createNewPeerConnection(peerId, false); // false indicates not an initiator
+                data?.peerIds?.forEach(peerId => {
+                    createNewPeerConnection(peerId, false);
                 });
+                if (data.userCount !== undefined) {
+                    userCountDisplay.textContent = `Current Users: ${data.userCount}`;
+                }
             } else if (data.type === 'peer-disconnected') {
-                // A peer has disconnected
                 console.log('Peer disconnected:', data.peerId);
                 if (peerConnections[data.peerId]) {
                     peerConnections[data.peerId].close();
                     delete peerConnections[data.peerId];
                 }
+                if (data.userCount !== undefined) {
+                    userCountDisplay.textContent = `Current Users: ${data.userCount}`;
+                }
             } else if (data.type === 'offer') {
-                // Handle WebRTC offer
                 let peerConnection = peerConnections[data.from];
                 if (!peerConnection) {
                     peerConnection = new RTCPeerConnection();
@@ -169,29 +214,42 @@
                 await peerConnection.setLocalDescription(answer);
                 sendSignalingMessage({ type: 'answer', sdp: peerConnection.localDescription, to: data.from });
             } else if (data.type === 'answer') {
-                // Handle WebRTC answer
                 const peerConnection = peerConnections[data.from];
                 if (peerConnection) {
                     await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
                 }
             } else if (data.type === 'ice-candidate') {
-                // Handle ICE candidate
                 const peerConnection = peerConnections[data.from];
                 if (peerConnection) {
                     await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            }
+            if (data?.userCount !== undefined) {
+                if (data.userCount > 1) {
+                    userNotJoinInfo.style.display = 'none';
+                    Array.from(fileSections).forEach(section => {
+                        section.style.display = 'block';
+                    });
+                    editor.style.display = 'block';
+                } else {
+                    userNotJoinInfo.style.display = 'block';
+                    Array.from(fileSections).forEach(section => {
+                        section.style.display = 'none';
+                    });
+                    editor.style.display = 'none';
                 }
             }
         };
 
         ws.onclose = () => {
             console.log('WebSocket disconnected');
-            // Close all peer connections when WebSocket disconnects
             for (const peerId in peerConnections) {
                 if (peerConnections.hasOwnProperty(peerId)) {
                     peerConnections[peerId].close();
                     delete peerConnections[peerId];
                 }
             }
+            userCountDisplay.textContent = `Current Users: 0`;
         };
 
         ws.onerror = (error) => {
@@ -202,7 +260,6 @@
             ws.send(JSON.stringify({ type: 'text-sync', content: editor.value }));
         });
 
-        // WebRTC Setup
         function setupPeerConnection(peerConnection, peerId) {
             peerConnection.onicecandidate = (event) => {
                 if (event.candidate) {
@@ -224,14 +281,12 @@
             };
         }
 
-        // Function to initiate a new peer connection
         function createNewPeerConnection(peerId, isInitiator) {
             const peerConnection = new RTCPeerConnection();
             peerConnections[peerId] = peerConnection;
             setupPeerConnection(peerConnection, peerId);
 
             if (isInitiator) {
-                // Create data channel for file transfer if this peer initiates the connection
                 const fileDataChannel = peerConnection.createDataChannel('file-transfer');
                 handleFileSendDataChannel(fileDataChannel);
 
@@ -244,15 +299,14 @@
             }
         }
 
-            let receivedFileBuffer = [];
-            let receivedFileName = '';
-            let receivedFileSize = 0;
-            let receivedBytes = 0;
+        let receivedFileBuffer = [];
+        let receivedFileName = '';
+        let receivedFileSize = 0;
+        let receivedBytes = 0;
 
         function handleFileReceiveDataChannel(dataChannel) {
             dataChannel.onmessage = (event) => {
                 if (typeof event.data === 'string') {
-                    // Metadata message
                     const metadata = JSON.parse(event.data);
                     receivedFileName = metadata.filename;
                     receivedFileSize = metadata.fileSize;
@@ -260,7 +314,6 @@
                     receivedFileBuffer = [];
                     console.log(`Receiving file: ${receivedFileName} (${receivedFileSize} bytes)`);
                 } else {
-                    // File data chunk
                     receivedFileBuffer.push(event.data);
                     receivedBytes += event.data.byteLength;
                     console.log(`Received ${receivedBytes} of ${receivedFileSize} bytes`);
@@ -270,13 +323,13 @@
                         const downloadUrl = URL.createObjectURL(receivedBlob);
 
                         const receivedFilesDiv = document.getElementById('receivedFiles');
-                        receivedFilesDiv.innerHTML = ''; // Clear previous messages
+                        receivedFilesDiv.innerHTML = '';
                         const fileEntry = document.createElement('div');
                         fileEntry.innerHTML = `<a href="${downloadUrl}" download="${receivedFileName}">${receivedFileName} (Download)</a>`;
                         receivedFilesDiv.appendChild(fileEntry);
 
                         console.log('File received and ready for download:', receivedFileName);
-                        receivedFileBuffer = []; // Clear buffer
+                        receivedFileBuffer = [];
                     }
                 }
             };
@@ -297,17 +350,14 @@
             if (fileInput.files.length > 0) {
                 const file = fileInput.files[0];
 
-                // Simulate sending file metadata via WebSocket to signal other peers
                 ws.send(JSON.stringify({ type: 'file-sent', filename: file.name, fileSize: file.size }));
 
                 const sentFilesDiv = document.getElementById('sentFiles');
-                sentFilesDiv.innerHTML = ''; // Clear "No documents sent yet."
+                sentFilesDiv.innerHTML = '';
                 const fileEntry = document.createElement('div');
                 fileEntry.innerHTML = `<p>${file.name} (Sending...)</p>`;
                 sentFilesDiv.appendChild(fileEntry);
 
-                // For simplicity, we'll iterate through all connected peers and send the file to each
-                // In a real scenario, you might select specific peers or broadcast more efficiently
                 for (const peerId in peerConnections) {
                     if (peerConnections.hasOwnProperty(peerId)) {
                         const peerConnection = peerConnections[peerId];
@@ -318,7 +368,7 @@
                             console.log(`Send DataChannel ready for ${peerId}, sending file...`);
                             sendChannel.send(JSON.stringify({ filename: file.name, fileSize: file.size }));
 
-                            const chunkSize = 16 * 1024; // 16KB chunks
+                            const chunkSize = 16 * 1024;
                             let offset = 0;
 
                             const fileReader = new FileReader();
