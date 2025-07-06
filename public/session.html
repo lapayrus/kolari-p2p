@@ -313,11 +313,11 @@
                     receivedFileSize = metadata.fileSize;
                     receivedBytes = 0;
                     receivedFileBuffer = [];
-                    console.log(`Receiving file: ${receivedFileName} (${receivedFileSize} bytes)`);
+                    console.log(`Receiving file: ${receivedFileName} (${receivedFileSize} bytes). Starting transfer...`);
                 } else {
                     receivedFileBuffer.push(event.data);
                     receivedBytes += event.data.byteLength;
-                    console.log(`Received ${receivedBytes} of ${receivedFileSize} bytes`);
+                    console.log(`Received ${receivedBytes} of ${receivedFileSize} bytes. Progress: ${((receivedBytes / receivedFileSize) * 100).toFixed(2)}%`);
 
                     if (receivedBytes === receivedFileSize) {
                         const receivedBlob = new Blob(receivedFileBuffer);
@@ -366,7 +366,7 @@
                         handleFileSendDataChannel(sendChannel);
 
                         sendChannel.onopen = () => {
-                            console.log(`Send DataChannel ready for ${peerId}, sending file...`);
+                            console.log(`Send DataChannel ready for ${peerId}, sending file: ${file.name} (${file.size} bytes)...`);
                             sendChannel.send(JSON.stringify({ filename: file.name, fileSize: file.size }));
 
                             const chunkSize = 16 * 1024;
@@ -380,7 +380,7 @@
                                 if (offset < file.size) {
                                     readNextChunk();
                                 } else {
-                                    console.log(`File sent successfully to ${peerId}!`);
+                                    console.log(`File ${file.name} sent successfully to ${peerId}! Total bytes sent: ${offset}`);
                                     fileEntry.innerHTML = `<p>${file.name} (Sent)</p>`;
                                 }
                             };
